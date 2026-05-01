@@ -13,3 +13,4 @@ node_modules/
 .DS_Store
 secure_pass/
 >>>>>>> a633839 (Event PDA stores Organizerr, Ticket mint, Max resale price, royalty basis points and tickets minted)
+secure_pass/
