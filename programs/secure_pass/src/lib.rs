@@ -4,8 +4,9 @@ use anchor_lang::{
 };
 // Use the Token-2022 standard for built-in features
 use anchor_spl::{
+    associated_token::AssociatedToken,
     token_2022,
-    token_interface::{self, Mint, MintTo, TokenAccount, TokenInterface},
+    token_interface::{self, Burn, Mint, MintTo, TokenAccount, TokenInterface, TransferChecked},
 };
 use spl_tlv_account_resolution::{
     account::ExtraAccountMeta, seeds::Seed, state::ExtraAccountMetaList,
@@ -18,6 +19,8 @@ use spl_transfer_hook_interface::{
 declare_id!("EGizM15vjmre3oskrBNg3Mh6dBrfDp2Xcw74SyfU12jV");
 
 const MAX_BASIS_POINTS: u16 = 10_000;
+const MAX_TICKET_NAME_LEN: usize = 64;
+const MAX_IMAGE_URI_LEN: usize = 200;
 
 #[program]
 pub mod secure_pass {
@@ -44,25 +47,174 @@ pub mod secure_pass {
     /// Register an event policy before issuing tickets for its mint.
     pub fn initialize_event(
         ctx: Context<InitializeEvent>,
-        max_resale_price_lamports: u64,
+        ticket_name: String,
+        image_uri: String,
+        ticket_price_payment_units: u64,
+        max_resale_price_payment_units: u64,
         royalty_basis_points: u16,
+        refund_basis_points: u16,
     ) -> Result<()> {
         require!(
             royalty_basis_points <= MAX_BASIS_POINTS,
             SecurePassError::InvalidRoyaltyBasisPoints
         );
+        require!(
+            refund_basis_points <= MAX_BASIS_POINTS,
+            SecurePassError::InvalidRefundBasisPoints
+        );
+        require!(
+            !ticket_name.is_empty() && ticket_name.len() <= MAX_TICKET_NAME_LEN,
+            SecurePassError::InvalidTicketName
+        );
+        require!(
+            !image_uri.is_empty() && image_uri.len() <= MAX_IMAGE_URI_LEN,
+            SecurePassError::InvalidImageUri
+        );
 
         let event = &mut ctx.accounts.event;
         event.organizer = ctx.accounts.organizer.key();
         event.ticket_mint = ctx.accounts.ticket_mint.key();
-        event.max_resale_price_lamports = max_resale_price_lamports;
+        event.payment_mint = ctx.accounts.payment_mint.key();
+        event.treasury_authority = ctx.accounts.treasury_authority.key();
+        event.treasury_token_account = ctx.accounts.treasury_token_account.key();
+        event.ticket_name = ticket_name;
+        event.image_uri = image_uri;
+        event.ticket_price_payment_units = ticket_price_payment_units;
+        event.max_resale_price_payment_units = max_resale_price_payment_units;
         event.royalty_basis_points = royalty_basis_points;
+        event.refund_basis_points = refund_basis_points;
         event.tickets_minted = 0;
 
         msg!(
-            "Event initialized for mint {:?} with max resale price {} lamports.",
+            "Event initialized for mint {:?} with payment mint {:?} and max resale price {} payment units.",
             event.ticket_mint,
-            event.max_resale_price_lamports
+            event.payment_mint,
+            event.max_resale_price_payment_units
+        );
+        Ok(())
+    }
+
+    /// Purchase and mint a ticket in one transaction after paying the treasury in the configured SPL token.
+    pub fn purchase_ticket(ctx: Context<PurchaseTicket>) -> Result<()> {
+        let organizer_key = ctx.accounts.event.organizer;
+        let ticket_mint_key = ctx.accounts.ticket_mint.key();
+        let payment_mint_key = ctx.accounts.payment_mint.key();
+        let treasury_authority_bump = ctx.bumps.treasury_authority;
+        let treasury_authority_seeds = [
+            b"treasury_authority".as_ref(),
+            organizer_key.as_ref(),
+            ticket_mint_key.as_ref(),
+            payment_mint_key.as_ref(),
+            &[treasury_authority_bump],
+        ];
+        let transfer_accounts = TransferChecked {
+            from: ctx.accounts.buyer_payment_token_account.to_account_info(),
+            mint: ctx.accounts.payment_mint.to_account_info(),
+            to: ctx.accounts.treasury_token_account.to_account_info(),
+            authority: ctx.accounts.buyer.to_account_info(),
+        };
+        let transfer_ctx = CpiContext::new(
+            ctx.accounts.payment_token_program.to_account_info(),
+            transfer_accounts,
+        );
+        token_interface::transfer_checked(
+            transfer_ctx,
+            ctx.accounts.event.ticket_price_payment_units,
+            ctx.accounts.payment_mint.decimals,
+        )?;
+
+        let cpi_accounts = MintTo {
+            mint: ctx.accounts.ticket_mint.to_account_info(),
+            to: ctx.accounts.buyer_token_account.to_account_info(),
+            authority: ctx.accounts.mint_authority.to_account_info(),
+        };
+        let mint_authority_bump = ctx.bumps.mint_authority;
+        let signer_seeds = [
+            b"mint_authority".as_ref(),
+            organizer_key.as_ref(),
+            ticket_mint_key.as_ref(),
+            &[mint_authority_bump],
+        ];
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let signer = [&signer_seeds[..]];
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, &signer);
+        token_interface::mint_to(cpi_ctx, 1)?;
+
+        let buyer_vault = &mut ctx.accounts.buyer_vault;
+        buyer_vault.ticket_count = buyer_vault
+            .ticket_count
+            .checked_add(1)
+            .ok_or(SecurePassError::TicketCountOverflow)?;
+
+        let event = &mut ctx.accounts.event;
+        event.tickets_minted = event
+            .tickets_minted
+            .checked_add(1)
+            .ok_or(SecurePassError::TicketCountOverflow)?;
+
+        msg!(
+            "Ticket purchased for event {:?}: {} using payment mint {:?}.",
+            event.ticket_mint,
+            event.ticket_name,
+            payment_mint_key
+        );
+        Ok(())
+    }
+
+    /// Burn a ticket and refund the configured percentage from the treasury token account.
+    pub fn burn_ticket_for_refund(ctx: Context<BurnTicketForRefund>) -> Result<()> {
+        let ticket_mint_key = ctx.accounts.ticket_mint.key();
+        let payment_mint_key = ctx.accounts.payment_mint.key();
+        let cpi_accounts = Burn {
+            mint: ctx.accounts.ticket_mint.to_account_info(),
+            from: ctx.accounts.buyer_token_account.to_account_info(),
+            authority: ctx.accounts.buyer.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
+        token_interface::burn(cpi_ctx, 1)?;
+
+        let refund_payment_units = (ctx.accounts.event.ticket_price_payment_units as u128)
+            .checked_mul(ctx.accounts.event.refund_basis_points as u128)
+            .ok_or(SecurePassError::TicketCountOverflow)?
+            .checked_div(MAX_BASIS_POINTS as u128)
+            .ok_or(SecurePassError::TicketCountOverflow)? as u64;
+
+        let treasury_authority_bump = ctx.bumps.treasury_authority;
+        let treasury_authority_seeds = [
+            b"treasury_authority".as_ref(),
+            ctx.accounts.event.organizer.as_ref(),
+            ticket_mint_key.as_ref(),
+            payment_mint_key.as_ref(),
+            &[treasury_authority_bump],
+        ];
+        let signer = [&treasury_authority_seeds[..]];
+        let transfer_accounts = TransferChecked {
+            from: ctx.accounts.treasury_token_account.to_account_info(),
+            mint: ctx.accounts.payment_mint.to_account_info(),
+            to: ctx.accounts.buyer_payment_token_account.to_account_info(),
+            authority: ctx.accounts.treasury_authority.to_account_info(),
+        };
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.payment_token_program.to_account_info(),
+            transfer_accounts,
+            &signer,
+        );
+        token_interface::transfer_checked(
+            transfer_ctx,
+            refund_payment_units,
+            ctx.accounts.payment_mint.decimals,
+        )?;
+
+        let buyer_vault = &mut ctx.accounts.buyer_vault;
+        buyer_vault.ticket_count = buyer_vault
+            .ticket_count
+            .checked_sub(1)
+            .ok_or(SecurePassError::TicketCountOverflow)?;
+
+        msg!(
+            "Ticket burned and refunded {} payment units to {}.",
+            refund_payment_units,
+            ctx.accounts.buyer.key()
         );
         Ok(())
     }
@@ -175,7 +327,7 @@ pub mod secure_pass {
     pub fn validate_ticket_resale(
         ctx: Context<ValidateTicketTransfer>,
         amount: u64,
-        resale_price_lamports: u64,
+        resale_price_payment_units: u64,
     ) -> Result<()> {
         validate_transfer_policy(
             &ctx.accounts.event,
@@ -185,7 +337,7 @@ pub mod secure_pass {
             &ctx.accounts.destination_vault,
             &ctx.accounts.ticket_mint,
             amount,
-            Some(resale_price_lamports),
+            Some(resale_price_payment_units),
         )
     }
 
@@ -233,12 +385,19 @@ pub struct CreateTicketMint<'info> {
         ],
         bump,
         mint::decimals = 0,
-        mint::authority = organizer,
+        mint::authority = mint_authority,
         mint::token_program = token_program,
-        extensions::transfer_hook::authority = organizer,
+        extensions::transfer_hook::authority = mint_authority,
         extensions::transfer_hook::program_id = secure_pass_program,
     )]
     pub ticket_mint: InterfaceAccount<'info, Mint>,
+
+    /// CHECK: PDA authority used to mint tickets without the organizer re-signing every sale.
+    #[account(
+        seeds = [b"mint_authority", organizer.key().as_ref(), &event_id.to_le_bytes()],
+        bump,
+    )]
+    pub mint_authority: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub organizer: Signer<'info>,
@@ -273,6 +432,31 @@ pub struct InitializeEvent<'info> {
         constraint = ticket_mint.to_account_info().owner == &token_2022::ID @ SecurePassError::InvalidTokenProgram,
     )]
     pub ticket_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        constraint = *payment_mint.to_account_info().owner == payment_token_program.key() @ SecurePassError::InvalidPaymentTokenProgram,
+    )]
+    pub payment_mint: InterfaceAccount<'info, Mint>,
+
+    pub payment_token_program: Interface<'info, TokenInterface>,
+
+    pub associated_token_program: Program<'info, AssociatedToken>,
+
+    #[account(
+        seeds = [b"treasury_authority", organizer.key().as_ref(), ticket_mint.key().as_ref(), payment_mint.key().as_ref()],
+        bump
+    )]
+    /// CHECK: PDA that signs for the payment-token treasury ATA.
+    pub treasury_authority: UncheckedAccount<'info>,
+
+    #[account(
+        init,
+        payer = organizer,
+        associated_token::mint = payment_mint,
+        associated_token::authority = treasury_authority,
+        associated_token::token_program = payment_token_program,
+    )]
+    pub treasury_token_account: InterfaceAccount<'info, TokenAccount>,
 
     pub system_program: Program<'info, System>,
 }
@@ -391,32 +575,188 @@ pub struct ValidateTicketTransfer<'info> {
 }
 
 #[derive(Accounts)]
-pub struct ExecuteTransfer<'info> {
-    #[account(
-        constraint = source_token_account.mint == ticket_mint.key() @ SecurePassError::InvalidTransferMint,
-        constraint = source_token_account.owner == transfer_authority.key() @ SecurePassError::InvalidTransferAuthority,
-    )]
-    pub source_token_account: InterfaceAccount<'info, TokenAccount>,
+pub struct PurchaseTicket<'info> {
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+
+    /// CHECK: Organizer public key used for PDA derivation and event identity.
+    pub organizer: UncheckedAccount<'info>,
 
     #[account(
+        mut,
+        seeds = [b"vault", buyer.key().as_ref()],
+        bump,
+        constraint = buyer_vault.owner == buyer.key() @ SecurePassError::InvalidVaultOwner,
+    )]
+    pub buyer_vault: Account<'info, UserVault>,
+
+    #[account(
+        mut,
+        seeds = [b"event", organizer.key().as_ref(), ticket_mint.key().as_ref()],
+        bump,
+        constraint = event.organizer == organizer.key() @ SecurePassError::InvalidEventOrganizer,
+        constraint = event.ticket_mint == ticket_mint.key() @ SecurePassError::InvalidEventMint,
+    )]
+    pub event: Account<'info, Event>,
+
+    #[account(
+        mut,
         constraint = ticket_mint.to_account_info().owner == &token_2022::ID @ SecurePassError::InvalidTokenProgram,
     )]
     pub ticket_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        constraint = *payment_mint.to_account_info().owner == payment_token_program.key() @ SecurePassError::InvalidPaymentTokenProgram,
+    )]
+    pub payment_mint: InterfaceAccount<'info, Mint>,
+
+    /// CHECK: PDA mint authority derived from the organizer and mint.
+    #[account(
+        seeds = [b"mint_authority", organizer.key().as_ref(), ticket_mint.key().as_ref()],
+        bump,
+    )]
+    pub mint_authority: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        token::mint = ticket_mint,
+        token::authority = buyer,
+        token::token_program = token_program,
+    )]
+    pub buyer_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        constraint = payment_token_program.key() == *payment_mint.to_account_info().owner @ SecurePassError::InvalidPaymentTokenProgram,
+    )]
+    pub payment_token_program: Interface<'info, TokenInterface>,
+
+    #[account(
+        mut,
+        token::mint = payment_mint,
+        token::authority = buyer,
+        token::token_program = payment_token_program,
+    )]
+    pub buyer_payment_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        token::mint = payment_mint,
+        token::authority = treasury_authority,
+        token::token_program = payment_token_program,
+    )]
+    pub treasury_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    /// CHECK: Treasury authority PDA that signs the refund transfer.
+    #[account(
+        seeds = [b"treasury_authority", organizer.key().as_ref(), ticket_mint.key().as_ref(), payment_mint.key().as_ref()],
+        bump,
+    )]
+    pub treasury_authority: UncheckedAccount<'info>,
+
+    #[account(
+        constraint = token_program.key() == token_2022::ID @ SecurePassError::InvalidTokenProgram,
+    )]
+    pub token_program: Interface<'info, TokenInterface>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct BurnTicketForRefund<'info> {
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+
+    /// CHECK: Organizer public key used for PDA derivation and event identity.
+    pub organizer: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"vault", buyer.key().as_ref()],
+        bump,
+        constraint = buyer_vault.owner == buyer.key() @ SecurePassError::InvalidVaultOwner,
+    )]
+    pub buyer_vault: Account<'info, UserVault>,
+
+    #[account(
+        mut,
+        seeds = [b"event", organizer.key().as_ref(), ticket_mint.key().as_ref()],
+        bump,
+        constraint = event.organizer == organizer.key() @ SecurePassError::InvalidEventOrganizer,
+        constraint = event.ticket_mint == ticket_mint.key() @ SecurePassError::InvalidEventMint,
+    )]
+    pub event: Account<'info, Event>,
+
+    #[account(
+        mut,
+        constraint = ticket_mint.to_account_info().owner == &token_2022::ID @ SecurePassError::InvalidTokenProgram,
+    )]
+    pub ticket_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        constraint = *payment_mint.to_account_info().owner == payment_token_program.key() @ SecurePassError::InvalidPaymentTokenProgram,
+    )]
+    pub payment_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        mut,
+        token::mint = ticket_mint,
+        token::authority = buyer,
+        token::token_program = token_program,
+    )]
+    pub buyer_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        constraint = payment_token_program.key() == *payment_mint.to_account_info().owner @ SecurePassError::InvalidPaymentTokenProgram,
+    )]
+    pub payment_token_program: Interface<'info, TokenInterface>,
+
+    #[account(
+        mut,
+        token::mint = payment_mint,
+        token::authority = buyer,
+        token::token_program = payment_token_program,
+    )]
+    pub buyer_payment_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        token::mint = payment_mint,
+        token::authority = treasury_authority,
+        token::token_program = payment_token_program,
+    )]
+    pub treasury_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    /// CHECK: Treasury authority PDA that signs the refund transfer.
+    #[account(
+        seeds = [b"treasury_authority", organizer.key().as_ref(), ticket_mint.key().as_ref(), payment_mint.key().as_ref()],
+        bump,
+    )]
+    pub treasury_authority: UncheckedAccount<'info>,
+
+    #[account(
+        constraint = token_program.key() == token_2022::ID @ SecurePassError::InvalidTokenProgram,
+    )]
+    pub token_program: Interface<'info, TokenInterface>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ExecuteTransfer<'info> {
+    #[account(
+        constraint = source_token_account.mint == ticket_mint.key() @ SecurePassError::InvalidTransferMint,
+    )]
+    pub source_token_account: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         constraint = destination_token_account.mint == ticket_mint.key() @ SecurePassError::InvalidTransferMint,
     )]
     pub destination_token_account: InterfaceAccount<'info, TokenAccount>,
 
-    /// CHECK: Token-2022 provides this account as the source owner or delegate.
-    pub transfer_authority: AccountInfo<'info>,
-
-    /// CHECK: Token-2022 validation-state PDA for this mint and hook program.
     #[account(
-        seeds = [b"extra-account-metas", ticket_mint.key().as_ref()],
-        bump,
+        constraint = ticket_mint.to_account_info().owner == &token_2022::ID @ SecurePassError::InvalidTokenProgram,
     )]
-    pub extra_account_metas: AccountInfo<'info>,
+    pub ticket_mint: InterfaceAccount<'info, Mint>,
 
     #[account(
         seeds = [b"event", event.organizer.as_ref(), ticket_mint.key().as_ref()],
@@ -448,7 +788,7 @@ fn validate_transfer_policy(
     destination_vault: &Account<UserVault>,
     ticket_mint: &InterfaceAccount<Mint>,
     amount: u64,
-    resale_price_lamports: Option<u64>,
+    resale_price_payment_units: Option<u64>,
 ) -> Result<()> {
     require!(amount == 1, SecurePassError::InvalidTransferAmount);
     require!(
@@ -470,9 +810,9 @@ fn validate_transfer_policy(
         SecurePassError::InvalidVaultOwner
     );
 
-    if let Some(price) = resale_price_lamports {
+    if let Some(price) = resale_price_payment_units {
         require!(
-            price <= event.max_resale_price_lamports,
+            price <= event.max_resale_price_payment_units,
             SecurePassError::ResalePriceTooHigh
         );
     }
@@ -494,13 +834,20 @@ impl UserVault {
 pub struct Event {
     pub organizer: Pubkey,
     pub ticket_mint: Pubkey,
-    pub max_resale_price_lamports: u64,
+    pub payment_mint: Pubkey,
+    pub treasury_authority: Pubkey,
+    pub treasury_token_account: Pubkey,
+    pub ticket_name: String,
+    pub image_uri: String,
+    pub ticket_price_payment_units: u64,
+    pub max_resale_price_payment_units: u64,
     pub royalty_basis_points: u16,
+    pub refund_basis_points: u16,
     pub tickets_minted: u64,
 }
 
 impl Event {
-    pub const SPACE: usize = 32 + 32 + 8 + 2 + 8;
+    pub const SPACE: usize = 32 + 32 + 32 + 32 + 32 + 32 + 4 + MAX_TICKET_NAME_LEN + 4 + MAX_IMAGE_URI_LEN + 8 + 8 + 2 + 2 + 8;
 }
 
 #[error_code]
@@ -511,8 +858,16 @@ pub enum SecurePassError {
     TicketCountOverflow,
     #[msg("SecurePass requires the Token-2022 program.")]
     InvalidTokenProgram,
+    #[msg("SecurePass requires the configured payment token program.")]
+    InvalidPaymentTokenProgram,
     #[msg("Royalty basis points must be between 0 and 10000.")]
     InvalidRoyaltyBasisPoints,
+    #[msg("Refund basis points must be between 0 and 10000.")]
+    InvalidRefundBasisPoints,
+    #[msg("Ticket name is required and must be within the configured limit.")]
+    InvalidTicketName,
+    #[msg("Image URI is required and must be within the configured limit.")]
+    InvalidImageUri,
     #[msg("The event organizer does not match the signer.")]
     InvalidEventOrganizer,
     #[msg("The event ticket mint does not match the provided mint.")]

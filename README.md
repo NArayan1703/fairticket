@@ -51,7 +51,7 @@ FairTicket uses blockchain to:
 
 ## Testing (Devnet)
 
-This project is deployed and tested on Solana Devnet.
+This project is configured for Solana Devnet.
 
 ### Tested Flow
 
