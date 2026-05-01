@@ -10,7 +10,7 @@ import { expect } from "chai";
 describe("secure_pass", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
-  const toDisc = (s: string) =>
+  const toDisc = (s) =>
     Buffer.from(anchor.utils.sha256.hash(s)).subarray(0, 8);
 
   const programId = new anchor.web3.PublicKey(
@@ -151,11 +151,11 @@ describe("secure_pass", () => {
         },
       },
     ],
-  } as unknown as anchor.Idl;
-  const program = new Program(idl, provider) as any;
+  };
+  const program = new Program(idl, provider);
   const user = provider.wallet;
 
-  const deriveVaultPda = (owner: anchor.web3.PublicKey) =>
+  const deriveVaultPda = (owner) =>
     anchor.web3.PublicKey.findProgramAddressSync(
       [Buffer.from("vault"), owner.toBuffer()],
       program.programId
@@ -163,13 +163,13 @@ describe("secure_pass", () => {
 
   const vaultPda = deriveVaultPda(user.publicKey);
 
-  const deriveEventPda = (mint: anchor.web3.PublicKey) =>
+  const deriveEventPda = (mint) =>
     anchor.web3.PublicKey.findProgramAddressSync(
       [Buffer.from("event"), user.publicKey.toBuffer(), mint.toBuffer()],
       program.programId
     )[0];
 
-  const deriveTicketMintPda = (eventId: anchor.BN) =>
+  const deriveTicketMintPda = (eventId) =>
     anchor.web3.PublicKey.findProgramAddressSync(
       [
         Buffer.from("ticket_mint"),
@@ -179,13 +179,13 @@ describe("secure_pass", () => {
       program.programId
     )[0];
 
-  const deriveExtraAccountMetasPda = (mint: anchor.web3.PublicKey) =>
+  const deriveExtraAccountMetasPda = (mint) =>
     anchor.web3.PublicKey.findProgramAddressSync(
       [Buffer.from("extra-account-metas"), mint.toBuffer()],
       program.programId
     )[0];
 
-  const createTicketMint = async (eventId: anchor.BN) => {
+  const createTicketMint = async (eventId) => {
     const mint = deriveTicketMintPda(eventId);
 
     await program.methods
@@ -202,10 +202,7 @@ describe("secure_pass", () => {
     return mint;
   };
 
-  const setupExtraAccountMetas = async (
-    mint: anchor.web3.PublicKey,
-    eventPda: anchor.web3.PublicKey
-  ) => {
+  const setupExtraAccountMetas = async (mint, eventPda) => {
     const extraAccountMetas = deriveExtraAccountMetasPda(mint);
 
     await program.methods
@@ -238,7 +235,6 @@ describe("secure_pass", () => {
   });
 
   it("Mints a Ticket", async () => {
-    // 1. Create a new hook-enabled ticket mint.
     const mint = await createTicketMint(new anchor.BN(1));
     const eventPda = deriveEventPda(mint);
 
@@ -253,10 +249,9 @@ describe("secure_pass", () => {
       .rpc();
     await setupExtraAccountMetas(mint, eventPda);
 
-    // 2. Create the user's pocket (Token Account)
     const userTokenAccount = await getOrCreateAssociatedTokenAccount(
       provider.connection,
-      (user as any).payer,
+      user.payer,
       mint,
       user.publicKey,
       false,
@@ -265,12 +260,11 @@ describe("secure_pass", () => {
       TOKEN_2022_PROGRAM_ID
     );
 
-    // 3. Call the program to mint
     await program.methods
       .mintTicket()
       .accounts({
         user: user.publicKey,
-        organizer: user.publicKey, // User is organizer for this test
+        organizer: user.publicKey,
         vault: vaultPda,
         event: eventPda,
         ticketMint: mint,
@@ -320,7 +314,7 @@ describe("secure_pass", () => {
     const otherUser = anchor.web3.Keypair.generate();
     const otherTokenAccount = await getOrCreateAssociatedTokenAccount(
       provider.connection,
-      (user as any).payer,
+      user.payer,
       mint,
       otherUser.publicKey,
       false,
@@ -345,7 +339,7 @@ describe("secure_pass", () => {
 
       expect.fail("Expected mintTicket to reject a mismatched token account");
     } catch (error) {
-      expect((error as Error).message).to.include("ConstraintTokenOwner");
+      expect(error.message).to.include("ConstraintTokenOwner");
     }
 
     const vaultAccount = await program.account.userVault.fetch(vaultPda);
@@ -391,7 +385,7 @@ describe("secure_pass", () => {
 
     const sellerTokenAccount = await getOrCreateAssociatedTokenAccount(
       provider.connection,
-      (user as any).payer,
+      user.payer,
       mint,
       user.publicKey,
       false,
@@ -402,7 +396,7 @@ describe("secure_pass", () => {
 
     const buyerTokenAccount = await getOrCreateAssociatedTokenAccount(
       provider.connection,
-      (user as any).payer,
+      user.payer,
       mint,
       buyer.publicKey,
       false,
@@ -448,7 +442,7 @@ describe("secure_pass", () => {
         "Expected resale validation to reject an overpriced transfer"
       );
     } catch (error) {
-      expect((error as Error).message).to.include("ResalePriceTooHigh");
+      expect(error.message).to.include("ResalePriceTooHigh");
     }
   });
 });
