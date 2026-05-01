@@ -1,16 +1,8 @@
-<<<<<<< HEAD
-.anchor
-.DS_Store
-target
-**/*.rs.bk
-node_modules
-test-ledger
-.yarn
-=======
 .anchor/
-target/
-node_modules/
+.codex
 .DS_Store
-secure_pass/
->>>>>>> a633839 (Event PDA stores Organizerr, Ticket mint, Max resale price, royalty basis points and tickets minted)
-secure_pass/
+target/
+**/*.rs.bk
+node_modules/
+test-ledger/
+.yarn/
